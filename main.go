@@ -87,7 +87,7 @@ func executeUpdates(interval int, authorizer *autorest.Authorizer, graphAuthoriz
 		if err != nil {
 			log.Panic(err)
 		}
-		runParallel(5, subs, func(sub string) {
+		runParallel(20, time.Second, subs, func(sub string) {
 			evaluateStatus(*authorizer, *graphAuthorizer, sub, start, now)
 		})
 		back, _ := time.ParseDuration(fmt.Sprintf("-%ds", interval*20))
@@ -167,15 +167,44 @@ func evaluateStatus(
 	}
 }
 
-func runParallel(parallelism int, objects []string, f func(obj string)) {
-	var wg sync.WaitGroup
+func runParallel(parallelism int, refreshInterval time.Duration, objects []string, f func(obj string)) {
 	throttle := make(chan interface{}, parallelism)
+	done := make(chan interface{})
+	go func() {
+		tick := time.NewTicker(refreshInterval)
+		for range tick.C {
+			// Check whether need to quit
+			select {
+			case <-done:
+				return
+			default:
+				break
+			}
+			// Refresh quanta via freeing the throttle channel.
+			// Note: In order to avoid the case that there are many backlog jobs
+			//       trying to fetch the quanta, we will have to fix the amount of
+			//       quanta to release.
+		ExauhstLoop:
+			for i := 0; i < len(throttle); i++ {
+				select {
+				case <-throttle:
+					continue
+				default:
+					break ExauhstLoop
+				}
+			}
+		}
+	}()
+
+	// Cancel the refresh goroutine before quit
+	defer func() { done <- struct{}{} }()
+
+	var wg sync.WaitGroup
 	for _, obj := range objects {
 		throttle <- struct{}{}
 		wg.Add(1)
 		go func(obj string) {
 			defer func() {
-				<-throttle
 				wg.Done()
 			}()
 			f(obj)
