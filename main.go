@@ -7,9 +7,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
-
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/profiles/2017-03-09/resources/mgmt/subscriptions"
 	"github.com/Azure/azure-sdk-for-go/profiles/2019-03-01/resources/mgmt/insights"
@@ -88,15 +87,9 @@ func executeUpdates(interval int, authorizer *autorest.Authorizer, graphAuthoriz
 		if err != nil {
 			log.Panic(err)
 		}
-		var wg sync.WaitGroup
-		for _, sub := range subs {
-			wg.Add(1)
-			go func(sub string) {
-				defer wg.Done()
-				evaluateStatus(*authorizer, *graphAuthorizer, sub, start, now)
-			}(sub)
-		}
-		wg.Wait()
+		runParallel(5, subs, func(sub string) {
+			evaluateStatus(*authorizer, *graphAuthorizer, sub, start, now)
+		})
 		back, _ := time.ParseDuration(fmt.Sprintf("-%ds", interval*20))
 		start = now.Add(back)
 	}
@@ -172,4 +165,21 @@ func evaluateStatus(
 			}
 		}
 	}
+}
+
+func runParallel(parallelism int, objects []string, f func(obj string)) {
+	var wg sync.WaitGroup
+	throttle := make(chan interface{}, parallelism)
+	for _, obj := range objects {
+		throttle <- struct{}{}
+		wg.Add(1)
+		go func(obj string) {
+			defer func() {
+				<-throttle
+				wg.Done()
+			}()
+			f(obj)
+		}(obj)
+	}
+	wg.Wait()
 }
