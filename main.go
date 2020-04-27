@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"sync"
+
 	"github.com/Azure/azure-sdk-for-go/profiles/2017-03-09/resources/mgmt/subscriptions"
 	"github.com/Azure/azure-sdk-for-go/profiles/2019-03-01/resources/mgmt/insights"
 	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2019-05-01/resources"
@@ -79,18 +81,24 @@ func main() {
 
 // Method focus of this exercise
 func executeUpdates(interval int, authorizer *autorest.Authorizer, graphAuthorizer *autorest.Authorizer) {
-	for true {
+	ticker := time.NewTicker(time.Duration(interval) * 1e+9)
+	for range ticker.C {
 		now := time.Now()
 		subs, err := getSubscriptions(*authorizer)
 		if err != nil {
 			log.Panic(err)
 		}
+		var wg sync.WaitGroup
 		for _, sub := range subs {
-			evaluateStatus(*authorizer, *graphAuthorizer, sub, start, now)
+			wg.Add(1)
+			go func(sub string) {
+				defer wg.Done()
+				evaluateStatus(*authorizer, *graphAuthorizer, sub, start, now)
+			}(sub)
 		}
+		wg.Wait()
 		back, _ := time.ParseDuration(fmt.Sprintf("-%ds", interval*20))
 		start = now.Add(back)
-		time.Sleep(time.Duration(interval * 1e+9))
 	}
 }
 
