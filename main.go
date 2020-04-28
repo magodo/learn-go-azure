@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -80,36 +81,66 @@ func main() {
 
 // Method focus of this exercise
 func executeUpdates(interval int, authorizer *autorest.Authorizer, graphAuthorizer *autorest.Authorizer) {
-	ticker := time.NewTicker(time.Duration(interval) * 1e+9)
+	refreshInterval := 5 * time.Second
+	quanta := 20                         // How many azure API is allowed to be called per "refreshInterval"
+	qc := make(chan interface{}, quanta) // quanta channel, used to throttle azure api call
+	ctx := context.Background()
+
+	// TODO: capture the SIGINT/SIGTERM to cancel the `ctx`
+
+	// spawn the refresh quanta go routine, which will cleanup the "qc" every "refreshInterval"
+	go refreshQuanta(ctx, qc, refreshInterval)
+
+	timeout := time.Duration(interval * 1e+9)
+	ticker := time.NewTicker(timeout)
 	for range ticker.C {
 		now := time.Now()
 		subs, err := getSubscriptions(*authorizer)
 		if err != nil {
 			log.Panic(err)
 		}
-		runParallel(20, time.Second, subs, func(sub string) {
-			evaluateStatus(*authorizer, *graphAuthorizer, sub, start, now)
-		})
+
+		ctx, _ := context.WithTimeout(ctx, timeout)
+		var wg sync.WaitGroup
+		for _, sub := range subs {
+			wg.Add(1)
+			go func(ctx context.Context, sub string, start, now time.Time) {
+				defer wg.Done()
+				evaluateStatus(ctx, *authorizer, *graphAuthorizer, sub, start, now,
+					func(p autorest.Preparer) autorest.Preparer {
+						return autorest.PreparerFunc(func(r *http.Request) (*http.Request, error) {
+							// try to get a quanta before moving on (i.e. sending the azure API)
+							qc <- struct{}{}
+							return p.Prepare(r)
+						})
+					})
+			}(ctx, sub, start, now)
+		}
+		wg.Wait()
+
 		back, _ := time.ParseDuration(fmt.Sprintf("-%ds", interval*20))
 		start = now.Add(back)
 	}
 }
 
 func evaluateStatus(
+	ctx context.Context,
 	auth autorest.Authorizer, authGraph autorest.Authorizer,
 	subscription string,
-	fromTime time.Time, toTime time.Time) {
+	fromTime time.Time, toTime time.Time, inspector autorest.PrepareDecorator) {
 	log.Printf("Evaluating status for: %s", subscription)
 
 	resourceClient := resources.NewClient(subscription)
 	activityClient := insights.NewActivityLogsClient(subscription)
+	resourceClient.RequestInspector = inspector
+	activityClient.RequestInspector = inspector
 	activityClient.Authorizer = auth
 	resourceClient.Authorizer = auth
 
 	tstarts := fromTime.Format("2006-01-02T15:04:05")
 	ts := toTime.Format("2006-01-02T15:04:05")
 	filterString := fmt.Sprintf("eventTimestamp ge '%s' and eventTimestamp le '%s'", tstarts, ts)
-	listResources, err := activityClient.ListComplete(context.Background(), filterString, "")
+	listResources, err := activityClient.ListComplete(ctx, filterString, "")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -130,7 +161,7 @@ func evaluateStatus(
 			log.Println(strings.ToLower(*logActivity.ResourceType.Value))
 			continue
 		}
-		res, err := resourceClient.GetByID(context.Background(), resourceID, apiVersion)
+		res, err := resourceClient.GetByID(ctx, resourceID, apiVersion)
 
 		if res.Response.StatusCode != 404 && err != nil {
 			log.Println("REAL ERROR", err)
@@ -159,7 +190,7 @@ func evaluateStatus(
 				ID:   res.ID,
 				Tags: res.Tags,
 			}
-			_, err := resourceClient.UpdateByID(context.Background(), *resUpdate.ID, apiVersion, resUpdate)
+			_, err := resourceClient.UpdateByID(ctx, *resUpdate.ID, apiVersion, resUpdate)
 			if err != nil {
 				log.Println(err)
 			}
@@ -167,15 +198,13 @@ func evaluateStatus(
 	}
 }
 
-func runParallel(parallelism int, refreshInterval time.Duration, objects []string, f func(obj string)) {
-	throttle := make(chan interface{}, parallelism)
-	done := make(chan interface{})
+func refreshQuanta(ctx context.Context, c chan interface{}, refreshInterval time.Duration) {
 	go func() {
 		tick := time.NewTicker(refreshInterval)
 		for range tick.C {
 			// Check whether need to quit
 			select {
-			case <-done:
+			case <-ctx.Done():
 				return
 			default:
 				break
@@ -184,31 +213,15 @@ func runParallel(parallelism int, refreshInterval time.Duration, objects []strin
 			// Note: In order to avoid the case that there are many backlog jobs
 			//       trying to fetch the quanta, we will have to fix the amount of
 			//       quanta to release.
-		ExauhstLoop:
-			for i := 0; i < len(throttle); i++ {
+		ExhaustLoop:
+			for i := len(c); i > 0; i-- {
 				select {
-				case <-throttle:
+				case <-c:
 					continue
 				default:
-					break ExauhstLoop
+					break ExhaustLoop
 				}
 			}
 		}
 	}()
-
-	// Cancel the refresh goroutine before quit
-	defer func() { done <- struct{}{} }()
-
-	var wg sync.WaitGroup
-	for _, obj := range objects {
-		throttle <- struct{}{}
-		wg.Add(1)
-		go func(obj string) {
-			defer func() {
-				wg.Done()
-			}()
-			f(obj)
-		}(obj)
-	}
-	wg.Wait()
 }
